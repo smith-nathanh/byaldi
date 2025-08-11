@@ -4,7 +4,6 @@ from typing import Any, Dict, List, Optional, Union
 from PIL import Image
 
 from byaldi.colpali import ColPaliModel
-
 from byaldi.objects import Result
 
 # Optional langchain integration
@@ -26,10 +25,14 @@ class RAGMultiModalModel:
     ```python
     from byaldi import RAGMultiModalModel
 
+    # Load the default model (colqwen2.5-v0.2)
+    RAG = RAGMultiModalModel.from_pretrained()
+
+    # Or specify a different model
     RAG = RAGMultiModalModel.from_pretrained("vidore/colpali-v1.2")
     ```
 
-    Both methods will load a fully initialised instance of ColPali, which you can use to build and query indexes.
+    Both methods will load a fully initialised instance of ColPali/ColQwen2.5, which you can use to build and query indexes.
 
     ```python
     RAG.search("How many people live in France?")
@@ -41,7 +44,7 @@ class RAGMultiModalModel:
     @classmethod
     def from_pretrained(
         cls,
-        pretrained_model_name_or_path: Union[str, Path],
+        pretrained_model_name_or_path: Union[str, Path] = "vidore/colqwen2.5-v0.2",
         index_root: str = ".byaldi",
         device: str = "cuda",
         verbose: int = 1,
@@ -50,6 +53,7 @@ class RAGMultiModalModel:
 
         Parameters:
             pretrained_model_name_or_path (str): Local path or huggingface model name.
+                                               Defaults to "vidore/colqwen2.5-v0.2".
             device (str): The device to load the model on. Default is "cuda".
 
         Returns:
@@ -159,7 +163,7 @@ class RAGMultiModalModel:
         self,
         query: Union[str, List[str]],
         k: int = 10,
-        filter_metadata: Optional[Dict[str,str]] = None,
+        filter_metadata: Optional[Dict[str, str]] = None,
         return_base64_results: Optional[bool] = None,
     ) -> Union[List[Result], List[List[Result]]]:
         """Query an index.

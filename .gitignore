@@ -139,3 +139,7 @@ pylate/*
 pylate/
 
 .byaldi/
+
+
+colqwen2_5
+modeling_llama_nemoretrievercolembed.py

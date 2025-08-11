@@ -7,7 +7,14 @@ from typing import Dict, List, Optional, Union, cast
 
 import srsly
 import torch
-from colpali_engine.models import ColPali, ColPaliProcessor, ColQwen2, ColQwen2Processor
+from colpali_engine.models import (
+    ColPali,
+    ColPaliProcessor,
+    ColQwen2,
+    ColQwen2_5,
+    ColQwen2_5_Processor,
+    ColQwen2Processor,
+)
 from pdf2image import convert_from_path
 from PIL import Image
 
@@ -15,6 +22,29 @@ from byaldi.objects import Result
 
 # Import version directly from the package metadata
 VERSION = version("Byaldi")
+
+
+def _is_nemo_retriever_model(model_name: str) -> bool:
+    """Check if a model name corresponds to a NemoRetriever model."""
+    model_lower = model_name.lower()
+    return (
+        "nemo-retriever" in model_lower
+        or "nemoretriever" in model_lower
+        or "llama-nemo-retriever" in model_lower
+        or "llama-nemoretriever" in model_lower
+    )
+
+
+# Try to import the NemoRetriever class directly
+try:
+    from transformers import AutoModel
+
+    # We'll load the NemoRetriever using AutoModel.from_pretrained with trust_remote_code=True
+    NemoRetriever = None  # Will be set during model loading
+    NemoRetrieverProcessor = None  # Will be set during processor loading
+except ImportError:
+    NemoRetriever = None
+    NemoRetrieverProcessor = None
 
 
 class ColPaliModel:
@@ -35,9 +65,10 @@ class ColPaliModel:
         if (
             "colpali" not in pretrained_model_name_or_path.lower()
             and "colqwen2" not in pretrained_model_name_or_path.lower()
+            and not _is_nemo_retriever_model(pretrained_model_name_or_path)
         ):
             raise ValueError(
-                "This pre-release version of Byaldi only supports ColPali and ColQwen2 for now. Incorrect model name specified."
+                "This version of Byaldi supports ColPali, ColQwen2, ColQwen2.5, and NemoRetriever models. Incorrect model name specified."
             )
 
         if verbose > 0:
@@ -48,10 +79,12 @@ class ColPaliModel:
         self.pretrained_model_name_or_path = pretrained_model_name_or_path
         self.model_name = self.pretrained_model_name_or_path
         self.n_gpu = torch.cuda.device_count() if n_gpu == -1 else n_gpu
-        device = (
-            device or (
-                "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
-            )
+        device = device or (
+            "cuda"
+            if torch.cuda.is_available()
+            else "mps"
+            if torch.backends.mps.is_available()
+            else "cpu"
         )
         self.index_name = index_name
         self.verbose = verbose
@@ -77,6 +110,18 @@ class ColPaliModel:
                 ),
                 token=kwargs.get("hf_token", None) or os.environ.get("HF_TOKEN"),
             )
+        elif "colqwen2.5" in pretrained_model_name_or_path.lower():
+            self.model = ColQwen2_5.from_pretrained(
+                self.pretrained_model_name_or_path,
+                torch_dtype=torch.bfloat16,
+                device_map=(
+                    "cuda"
+                    if device == "cuda"
+                    or (isinstance(device, torch.device) and device.type == "cuda")
+                    else None
+                ),
+                token=kwargs.get("hf_token", None) or os.environ.get("HF_TOKEN"),
+            )
         elif "colqwen2" in pretrained_model_name_or_path.lower():
             self.model = ColQwen2.from_pretrained(
                 self.pretrained_model_name_or_path,
@@ -89,12 +134,44 @@ class ColPaliModel:
                 ),
                 token=kwargs.get("hf_token", None) or os.environ.get("HF_TOKEN"),
             )
-        self.model = self.model.eval()
+        elif _is_nemo_retriever_model(pretrained_model_name_or_path):
+            from transformers import AutoModel
+
+            self.model = AutoModel.from_pretrained(
+                self.pretrained_model_name_or_path,
+                device_map=(
+                    "cuda"
+                    if device == "cuda"
+                    or (isinstance(device, torch.device) and device.type == "cuda")
+                    else None
+                ),
+                trust_remote_code=True,
+                torch_dtype=torch.bfloat16,
+                attn_implementation="flash_attention_2",
+                revision="1f0fdea7f5b19532a750be109b19072d719b8177",
+            ).eval()
+        else:
+            raise ValueError(f"Unsupported model: {pretrained_model_name_or_path}")
+
+        # Only call eval() for non-NemoRetriever models
+        if not (
+            "nemoretriever" in pretrained_model_name_or_path.lower()
+            or "llama-nemoretriever" in pretrained_model_name_or_path.lower()
+        ):
+            self.model = self.model.eval()
 
         if "colpali" in pretrained_model_name_or_path.lower():
             self.processor = cast(
                 ColPaliProcessor,
                 ColPaliProcessor.from_pretrained(
+                    self.pretrained_model_name_or_path,
+                    token=kwargs.get("hf_token", None) or os.environ.get("HF_TOKEN"),
+                ),
+            )
+        elif "colqwen2.5" in pretrained_model_name_or_path.lower():
+            self.processor = cast(
+                ColQwen2_5_Processor,
+                ColQwen2_5_Processor.from_pretrained(
                     self.pretrained_model_name_or_path,
                     token=kwargs.get("hf_token", None) or os.environ.get("HF_TOKEN"),
                 ),
@@ -107,6 +184,33 @@ class ColPaliModel:
                     token=kwargs.get("hf_token", None) or os.environ.get("HF_TOKEN"),
                 ),
             )
+        elif _is_nemo_retriever_model(pretrained_model_name_or_path):
+            # NemoRetriever models handle their own processing internally
+            # We create a processor that provides the expected interface
+            class NemoRetrieverProcessor:
+                def __init__(self, model):
+                    self.model = model
+
+                def process_images(self, images):
+                    """
+                    Process images for NemoRetriever.
+                    Since NemoRetriever handles processing internally, we return a simple dict
+                    that will be handled by the model's __call__ method.
+                    """
+                    return {"images": images}
+
+                def process_queries(self, queries):
+                    """
+                    Process queries for NemoRetriever.
+                    Since NemoRetriever handles processing internally, we return a simple dict
+                    that will be handled by the model's __call__ method.
+                    """
+                    return {"queries": queries}
+
+                def score(self, query_embeddings, passage_embeddings):
+                    return self.model.get_scores(query_embeddings, passage_embeddings)
+
+            self.processor = NemoRetrieverProcessor(self.model)
 
         self.device = device
         if device != "cuda" and not (
@@ -534,11 +638,20 @@ class ColPaliModel:
 
         # Generate embedding
         with torch.inference_mode():
-            processed_image = {
-                k: v.to(self.device).to(self.model.dtype if v.dtype in [torch.float16, torch.bfloat16, torch.float32] else v.dtype)
-                for k, v in processed_image.items()
-            }
-            embedding = self.model(**processed_image)
+            if _is_nemo_retriever_model(self.pretrained_model_name_or_path):
+                # Use NemoRetriever's forward_passages method directly
+                embedding = self.model.forward_passages([image])
+            else:
+                # For ColPali/ColQwen models, use the standard API
+                processed_image = {
+                    k: v.to(self.device).to(
+                        self.model.dtype
+                        if v.dtype in [torch.float16, torch.bfloat16, torch.float32]
+                        else v.dtype
+                    )
+                    for k, v in processed_image.items()
+                }
+                embedding = self.model(**processed_image)
 
         # Add to index
         embed_id = len(self.indexed_embeddings)
@@ -592,24 +705,32 @@ class ColPaliModel:
     def remove_from_index(self):
         raise NotImplementedError("This method is not implemented yet.")
 
-    def filter_embeddings(self,filter_metadata:Dict[str,str]):
+    def filter_embeddings(self, filter_metadata: Dict[str, str]):
         req_doc_ids = []
-        for idx,metadata_dict in self.doc_id_to_metadata.items():
-            for metadata_key,metadata_value in metadata_dict.items():
+        for idx, metadata_dict in self.doc_id_to_metadata.items():
+            for metadata_key, metadata_value in metadata_dict.items():
                 if metadata_key in filter_metadata:
                     if filter_metadata[metadata_key] == metadata_value:
                         req_doc_ids.append(idx)
-                        
-        req_embedding_ids = [eid for eid,doc in self.embed_id_to_doc_id.items() if doc['doc_id'] in req_doc_ids]
-        req_embeddings = [ie for idx,ie in enumerate(self.indexed_embeddings) if idx in req_embedding_ids]
+
+        req_embedding_ids = [
+            eid
+            for eid, doc in self.embed_id_to_doc_id.items()
+            if doc["doc_id"] in req_doc_ids
+        ]
+        req_embeddings = [
+            ie
+            for idx, ie in enumerate(self.indexed_embeddings)
+            if idx in req_embedding_ids
+        ]
 
         return req_embeddings, req_embedding_ids
-    
+
     def search(
         self,
         query: Union[str, List[str]],
         k: int = 10,
-        filter_metadata: Optional[Dict[str,str]] = None,
+        filter_metadata: Optional[Dict[str, str]] = None,
         return_base64_results: Optional[bool] = None,
     ) -> Union[List[Result], List[List[Result]]]:
         # Set default value for return_base64_results if not provided
@@ -631,15 +752,24 @@ class ColPaliModel:
             # Process query
             with torch.inference_mode():
                 batch_query = self.processor.process_queries([q])
-                batch_query = {k: v.to(self.device).to(self.model.dtype if v.dtype in [torch.float16, torch.bfloat16, torch.float32] else v.dtype) for k, v in batch_query.items()}
+                batch_query = {
+                    k: v.to(self.device).to(
+                        self.model.dtype
+                        if v.dtype in [torch.float16, torch.bfloat16, torch.float32]
+                        else v.dtype
+                    )
+                    for k, v in batch_query.items()
+                }
                 embeddings_query = self.model(**batch_query)
             qs = list(torch.unbind(embeddings_query.to("cpu")))
             if not filter_metadata:
                 req_embeddings = self.indexed_embeddings
             else:
-                req_embeddings, req_embedding_ids = self.filter_embeddings(filter_metadata=filter_metadata) 
+                req_embeddings, req_embedding_ids = self.filter_embeddings(
+                    filter_metadata=filter_metadata
+                )
             # Compute scores
-            scores = self.processor.score(qs,req_embeddings).cpu().numpy()
+            scores = self.processor.score(qs, req_embeddings).cpu().numpy()
 
             # Get top k relevant pages
             top_pages = scores.argsort(axis=1)[0][-k:][::-1].tolist()
@@ -713,9 +843,22 @@ class ColPaliModel:
                 raise ValueError(f"Unsupported input type: {type(item)}")
 
         with torch.inference_mode():
-            batch = self.processor.process_images(images)
-            batch = {k: v.to(self.device).to(self.model.dtype if v.dtype in [torch.float16, torch.bfloat16, torch.float32] else v.dtype) for k, v in batch.items()}
-            embeddings = self.model(**batch)
+            # Check if this is a NemoRetriever model and handle it directly
+            if _is_nemo_retriever_model(self.pretrained_model_name_or_path):
+                # Use NemoRetriever's forward_passages method directly
+                embeddings = self.model.forward_passages(images)
+            else:
+                # For ColPali/ColQwen models, use the standard API
+                batch = self.processor.process_images(images)
+                batch = {
+                    k: v.to(self.device).to(
+                        self.model.dtype
+                        if v.dtype in [torch.float16, torch.bfloat16, torch.float32]
+                        else v.dtype
+                    )
+                    for k, v in batch.items()
+                }
+                embeddings = self.model(**batch)
 
         return embeddings.cpu()
 
@@ -734,9 +877,22 @@ class ColPaliModel:
             query = [query]
 
         with torch.inference_mode():
-            batch = self.processor.process_queries(query)
-            batch = {k: v.to(self.device).to(self.model.dtype if v.dtype in [torch.float16, torch.bfloat16, torch.float32] else v.dtype) for k, v in batch.items()}
-            embeddings = self.model(**batch)
+            # Check if this is a NemoRetriever model and handle it directly
+            if _is_nemo_retriever_model(self.pretrained_model_name_or_path):
+                # Use NemoRetriever's forward_queries method directly
+                embeddings = self.model.forward_queries(query)
+            else:
+                # For ColPali/ColQwen models, use the standard API
+                batch = self.processor.process_queries(query)
+                batch = {
+                    k: v.to(self.device).to(
+                        self.model.dtype
+                        if v.dtype in [torch.float16, torch.bfloat16, torch.float32]
+                        else v.dtype
+                    )
+                    for k, v in batch.items()
+                }
+                embeddings = self.model(**batch)
 
         return embeddings.cpu()
 
